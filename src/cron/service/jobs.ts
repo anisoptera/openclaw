@@ -95,8 +95,10 @@ function assertDeliverySupport(job: Pick<CronJob, "sessionTarget" | "delivery">)
     job.delivery.to = target;
     return;
   }
-  if (job.sessionTarget !== "isolated") {
-    throw new Error('cron channel delivery config is only supported for sessionTarget="isolated"');
+  if (job.sessionTarget !== "isolated" && job.sessionTarget !== "isolated-clean") {
+    throw new Error(
+      'cron channel delivery config is only supported for sessionTarget="isolated" or "isolated-clean"',
+    );
   }
 }
 

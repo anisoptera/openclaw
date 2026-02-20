@@ -187,6 +187,7 @@ export function buildGatewayCronService(params: {
     },
     runIsolatedAgentJob: async ({ job, message }) => {
       const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
+      const forceNew = job.sessionTarget === "isolated-clean";
       return await runCronIsolatedAgentTurn({
         cfg: runtimeConfig,
         deps: params.deps,
@@ -195,6 +196,7 @@ export function buildGatewayCronService(params: {
         agentId,
         sessionKey: `cron:${job.id}`,
         lane: "cron",
+        forceNew,
       });
     },
     log: getChildLogger({ module: "cron", storePath }),
