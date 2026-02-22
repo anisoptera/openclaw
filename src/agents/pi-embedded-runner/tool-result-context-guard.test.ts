@@ -87,6 +87,7 @@ async function applyGuardToContext(
   installToolResultContextGuard({
     agent,
     contextWindowTokens: 1_000,
+    recentToolResultsToPreserve: 0,
   });
   return await agent.transformContext?.(contextForNextCall, new AbortController().signal);
 }
@@ -119,6 +120,7 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
     const contextForNextCall = [
@@ -185,6 +187,7 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
     const contextForNextCall = [
@@ -221,6 +224,7 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
     const contextForNextCall = [
@@ -238,7 +242,12 @@ describe("installToolResultContextGuard", () => {
     expect(newResultText).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
   });
 
-  it("drops oversized read-tool details payloads when compacting tool results", async () => {
+  it("skips compacting tool results below minimum savings threshold", async () => {
+    // contextWindowTokens: 1_000 => contextBudgetChars = 1000 * 4 * 0.90 = 3600
+    // placeholder = 47 chars; minPerResultSavings = 47 * 2 = 94
+    // Small tool result: 50 chars text => weighted = max(50, ceil(50*2)) = 100
+    // potentialSavings = 100 - 47 = 53 < 94 => skipped per-result
+    // totalEligibleSavings = 0 < minPassSavings => pass skipped entirely
     const agent = makeGuardableAgent();
 
     installToolResultContextGuard({
@@ -246,8 +255,61 @@ describe("installToolResultContextGuard", () => {
       contextWindowTokens: 1_000,
     });
 
+    // Make context over budget with a large user message, but small tool results
+    // that don't meet the per-result savings threshold (53 < 94).
+    const smallText = "s".repeat(50);
     const contextForNextCall = [
-      makeUser("u".repeat(1_600)),
+      makeUser("u".repeat(3_700)), // push total over 3600 budget
+      makeToolResult("call_small_1", smallText),
+      makeToolResult("call_small_2", smallText),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    const first = getToolResultText(contextForNextCall[1]);
+    const second = getToolResultText(contextForNextCall[2]);
+
+    expect(first).toBe(smallText);
+    expect(second).toBe(smallText);
+  });
+
+  it("compacts tool results that meet minimum savings threshold", async () => {
+    // contextWindowTokens: 1_000 => contextBudgetChars = 3600, minSavingsChars = 72
+    // Tool result with 500 chars: weighted = max(500, ceil(500*2)) = 1000
+    // potentialSavings = 1000 - 94 = 906 >= 72 => should be compacted
+    const agent = makeGuardableAgent();
+
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const largeText = "L".repeat(500);
+    const contextForNextCall = [
+      makeUser("u".repeat(2_000)),
+      makeToolResult("call_large", largeText),
+      makeToolResult("call_large_2", largeText),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    const first = getToolResultText(contextForNextCall[1]);
+
+    expect(first).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
+  });
+
+  it("drops oversized read-tool details payloads when compacting tool results", async () => {
+    const agent = makeGuardableAgent();
+
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(2_200)),
       makeToolResultWithDetails("call_old", "x".repeat(900), "d".repeat(8_000)),
       makeToolResultWithDetails("call_new", "y".repeat(900), "d".repeat(8_000)),
     ];
@@ -267,5 +329,60 @@ describe("installToolResultContextGuard", () => {
     expect(newResultText).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
     expect(oldResult.details).toBeUndefined();
     expect(newResult.details).toBeUndefined();
+  });
+
+  it("preserves the most recent N tool results from preemptive compaction", async () => {
+    // With recentToolResultsToPreserve: 3 (default), the last 3 tool results are never
+    // replaced with placeholders — even when the context is over budget.
+    const agent = makeGuardableAgent();
+
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      // default recentToolResultsToPreserve: 3
+    });
+
+    // 4 tool results: oldest should be compacted, last 3 should be preserved.
+    const contextForNextCall = [
+      makeUser("u".repeat(500)),
+      makeToolResult("call_1", "a".repeat(800)), // oldest — eligible to compact
+      makeToolResult("call_2", "b".repeat(800)), // protected (within last 3)
+      makeToolResult("call_3", "c".repeat(800)), // protected
+      makeToolResult("call_4", "d".repeat(800)), // protected
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    expect(getToolResultText(contextForNextCall[1])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[2])).toBe("b".repeat(800));
+    expect(getToolResultText(contextForNextCall[3])).toBe("c".repeat(800));
+    expect(getToolResultText(contextForNextCall[4])).toBe("d".repeat(800));
+  });
+
+  it("respects a custom recentToolResultsToPreserve value", async () => {
+    const agent = makeGuardableAgent();
+
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 1,
+    });
+
+    // With preserve=1, only the very last result is safe; older ones can be compacted.
+    const contextForNextCall = [
+      makeUser("u".repeat(500)),
+      makeToolResult("call_old", "x".repeat(800)),
+      makeToolResult("call_mid", "y".repeat(800)),
+      makeToolResult("call_new", "z".repeat(800)), // protected
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    expect(getToolResultText(contextForNextCall[1])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[3])).toBe("z".repeat(800));
   });
 });

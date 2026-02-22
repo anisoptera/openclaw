@@ -2,8 +2,12 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 // Keep a conservative input budget to absorb tokenizer variance and provider framing overhead.
-const CONTEXT_INPUT_HEADROOM_RATIO = 0.75;
+const CONTEXT_INPUT_HEADROOM_RATIO = 0.9;
 const SINGLE_TOOL_RESULT_CONTEXT_SHARE = 0.5;
+// Minimum total savings (as fraction of context budget) required to justify a compaction pass.
+// Skipping passes with small total savings avoids cache busts that barely help and reduces
+// compaction frequency — when we do bust the cache, we get meaningful headroom back.
+const MIN_COMPACTION_SAVINGS_RATIO = 0.02; // 2% of context budget
 const TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE = 2;
 const IMAGE_CHAR_ESTIMATE = 8_000;
 
@@ -217,21 +221,77 @@ function truncateToolResultToChars(msg: AgentMessage, maxChars: number): AgentMe
 function compactExistingToolResultsInPlace(params: {
   messages: AgentMessage[];
   charsNeeded: number;
+  contextBudgetChars: number;
+  recentToolResultsToPreserve: number;
 }): number {
-  const { messages, charsNeeded } = params;
+  const { messages, charsNeeded, contextBudgetChars, recentToolResultsToPreserve } = params;
   if (charsNeeded <= 0) {
     return 0;
   }
 
+  const placeholderChars = PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER.length;
+  // Per-result minimum: savings must be at least 2× the placeholder size.
+  // Results smaller than this are not worth the per-entry cache perturbation.
+  const minPerResultSavings = placeholderChars * 2;
+
+  // Identify the most recent N tool-result indices to protect from compaction.
+  // These are results the model hasn't processed yet (or just processed this turn)
+  // and must remain intact so the model can act on them.
+  const toolResultIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (isToolResultMessage(messages[i])) {
+      toolResultIndices.push(i);
+    }
+  }
+  const protectedStart = Math.max(0, toolResultIndices.length - recentToolResultsToPreserve);
+  const protectedIndices = new Set(toolResultIndices.slice(protectedStart));
+
+  // Pre-scan: sum potential savings across eligible (non-protected) results.
+  // The pass-level gate ensures we only bust the cache when the total benefit justifies it.
+  let totalEligibleSavings = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (protectedIndices.has(i)) {
+      continue;
+    }
+    const msg = messages[i];
+    if (!isToolResultMessage(msg)) {
+      continue;
+    }
+    const before = estimateMessageChars(msg);
+    if (before <= placeholderChars) {
+      continue;
+    }
+    const potentialSavings = before - placeholderChars;
+    if (potentialSavings >= minPerResultSavings) {
+      totalEligibleSavings += potentialSavings;
+    }
+  }
+
+  // Pass-level gate: skip if total savings don't justify the cache bust.
+  const minPassSavings = Math.floor(contextBudgetChars * MIN_COMPACTION_SAVINGS_RATIO);
+  if (totalEligibleSavings < minPassSavings) {
+    return 0;
+  }
+
+  // Compact oldest-first, skipping protected and individually-trivial results.
   let reduced = 0;
   for (let i = 0; i < messages.length; i++) {
+    if (protectedIndices.has(i)) {
+      continue;
+    }
+
     const msg = messages[i];
     if (!isToolResultMessage(msg)) {
       continue;
     }
 
     const before = estimateMessageChars(msg);
-    if (before <= PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER.length) {
+    if (before <= placeholderChars) {
+      continue;
+    }
+
+    const potentialSavings = before - placeholderChars;
+    if (potentialSavings < minPerResultSavings) {
       continue;
     }
 
@@ -270,8 +330,10 @@ function enforceToolResultContextBudgetInPlace(params: {
   messages: AgentMessage[];
   contextBudgetChars: number;
   maxSingleToolResultChars: number;
+  recentToolResultsToPreserve: number;
 }): void {
-  const { messages, contextBudgetChars, maxSingleToolResultChars } = params;
+  const { messages, contextBudgetChars, maxSingleToolResultChars, recentToolResultsToPreserve } =
+    params;
 
   // Ensure each tool result has an upper bound before considering total context usage.
   for (const message of messages) {
@@ -291,14 +353,22 @@ function enforceToolResultContextBudgetInPlace(params: {
   compactExistingToolResultsInPlace({
     messages,
     charsNeeded: currentChars - contextBudgetChars,
+    contextBudgetChars,
+    recentToolResultsToPreserve,
   });
 }
 
 export function installToolResultContextGuard(params: {
   agent: GuardableAgent;
   contextWindowTokens: number;
+  /** Number of most-recent tool results to leave untouched during preemptive compaction.
+   *  Protects results the model hasn't had a chance to act on yet.
+   *  Defaults to 3 (covers parallel tool calls from a single assistant turn).
+   */
+  recentToolResultsToPreserve?: number;
 }): () => void {
   const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
+  const recentToolResultsToPreserve = params.recentToolResultsToPreserve ?? 3;
   const contextBudgetChars = Math.max(
     1_024,
     Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * CONTEXT_INPUT_HEADROOM_RATIO),
@@ -325,6 +395,7 @@ export function installToolResultContextGuard(params: {
       messages: contextMessages,
       contextBudgetChars,
       maxSingleToolResultChars,
+      recentToolResultsToPreserve,
     });
 
     return contextMessages;
