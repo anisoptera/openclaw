@@ -1,14 +1,17 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
+// Fallback chars-per-token ratios used when no empirical data is available (first API call
+// or providers that report zero usage). Real content is typically 3-4 chars/token.
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 // Keep a conservative input budget to absorb tokenizer variance and provider framing overhead.
 const CONTEXT_INPUT_HEADROOM_RATIO = 0.9;
 const SINGLE_TOOL_RESULT_CONTEXT_SHARE = 0.5;
-// Minimum total savings (as fraction of context budget) required to justify a compaction pass.
-// Skipping passes with small total savings avoids cache busts that barely help and reduces
-// compaction frequency — when we do bust the cache, we get meaningful headroom back.
-const MIN_COMPACTION_SAVINGS_RATIO = 0.02; // 2% of context budget
-const TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE = 2;
+// Minimum total savings (as fraction of context budget in tokens) required to justify a
+// compaction pass. Set high (15%) because each compaction busts the prompt cache — we only
+// want to pay that cost when the savings are substantial.
+const MIN_COMPACTION_SAVINGS_RATIO = 0.15;
+// Fallback for tool results; real tool outputs (code, JSON, text) are typically ~3 chars/token.
+const TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE = 3;
 const IMAGE_CHAR_ESTIMATE = 8_000;
 
 export const CONTEXT_LIMIT_TRUNCATION_NOTICE = "[truncated: output exceeded context limit]";
@@ -79,7 +82,8 @@ function getToolResultText(msg: AgentMessage): string {
   return chunks.join("\n");
 }
 
-function estimateMessageChars(msg: AgentMessage): number {
+/** Count raw characters in a message (no weighting). */
+function rawMessageChars(msg: AgentMessage): number {
   if (!msg || typeof msg !== "object") {
     return 0;
   }
@@ -150,17 +154,110 @@ function estimateMessageChars(msg: AgentMessage): number {
     }
     const details = (msg as { details?: unknown }).details;
     chars += estimateUnknownChars(details);
-    const weightedChars = Math.ceil(
-      chars * (CHARS_PER_TOKEN_ESTIMATE / TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE),
-    );
-    return Math.max(chars, weightedChars);
+    return chars;
   }
 
   return 256;
 }
 
-function estimateContextChars(messages: AgentMessage[]): number {
-  return messages.reduce((sum, msg) => sum + estimateMessageChars(msg), 0);
+// ── Empirical chars/token calibration ──────────────────────────────────────────
+// Derive the actual chars-per-token ratio from the last assistant message's
+// usage.input (exact prompt token count). Falls back to hardcoded constants
+// when no usage data exists (first call, or providers that report zero usage).
+
+type TokenCalibration = {
+  /** Empirical or fallback chars-per-token ratio for non-tool-result messages. */
+  charsPerToken: number;
+  /**
+   * Chars-per-token ratio for tool result messages. Equal to charsPerToken when empirical
+   * data is available (the ratio already reflects the content mix); falls back to the
+   * lower TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE constant on the first call or when providers
+   * report no usage (code/JSON/file listings tokenize at ~3 chars/token, not 4).
+   */
+  toolResultCharsPerToken: number;
+};
+
+function extractAssistantInputTokens(msg: AgentMessage): number | undefined {
+  if ((msg as { role?: unknown }).role !== "assistant") {
+    return undefined;
+  }
+  const usage = (msg as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== "object") {
+    return undefined;
+  }
+  const input = (usage as { input?: unknown }).input;
+  if (typeof input !== "number" || !Number.isFinite(input) || input <= 0) {
+    return undefined;
+  }
+  return input;
+}
+
+/**
+ * Calibrate chars/token from real API usage data.
+ * Scans messages for the last assistant message with usage.input, sums raw chars
+ * for all messages up to that point, and derives the empirical ratio.
+ */
+function calibrateCharsPerToken(messages: AgentMessage[]): TokenCalibration {
+  // Find the last assistant message with valid usage.input
+  let lastAssistantIdx = -1;
+  let lastAssistantInputTokens = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const tokens = extractAssistantInputTokens(messages[i]);
+    if (tokens !== undefined) {
+      lastAssistantIdx = i;
+      lastAssistantInputTokens = tokens;
+      break;
+    }
+  }
+
+  if (lastAssistantIdx < 0) {
+    return {
+      charsPerToken: CHARS_PER_TOKEN_ESTIMATE,
+      toolResultCharsPerToken: TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE,
+    };
+  }
+
+  // Sum raw chars for all messages BEFORE the assistant message (i < lastAssistantIdx).
+  // usage.input is the input token count — it does not include the assistant's own
+  // output tokens. Including the assistant's text chars in the numerator would inflate
+  // the ratio, making token estimates lower and biasing the guard toward not triggering.
+  // usage.input also includes the system prompt, which we can't measure here — so the
+  // ratio implicitly absorbs that overhead as a slight undercount of chars/token,
+  // making context estimates slightly larger (conservative direction).
+  let totalChars = 0;
+  for (let i = 0; i < lastAssistantIdx; i++) {
+    totalChars += rawMessageChars(messages[i]);
+  }
+
+  if (totalChars <= 0) {
+    return {
+      charsPerToken: CHARS_PER_TOKEN_ESTIMATE,
+      toolResultCharsPerToken: TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE,
+    };
+  }
+
+  const empirical = totalChars / lastAssistantInputTokens;
+  // Clamp to a sane range to avoid absurd ratios from degenerate cases
+  // (e.g., tiny conversations with large system prompts).
+  const clamped = Math.max(1.5, Math.min(empirical, 8));
+  // When empirical data is available, use one ratio for everything — it already
+  // reflects the actual content mix (code, JSON, prose) in this conversation.
+  return { charsPerToken: clamped, toolResultCharsPerToken: clamped };
+}
+
+/** Estimate total context tokens from raw char counts + calibrated ratios. */
+function estimateContextTokens(messages: AgentMessage[], cal: TokenCalibration): number {
+  let total = 0;
+  for (const msg of messages) {
+    total += estimateMessageTokens(msg, cal);
+  }
+  return total;
+}
+
+/** Estimate a single message's token cost using the appropriate ratio for its type. */
+function estimateMessageTokens(msg: AgentMessage, cal: TokenCalibration): number {
+  const ratio = isToolResultMessage(msg) ? cal.toolResultCharsPerToken : cal.charsPerToken;
+  return Math.ceil(rawMessageChars(msg) / ratio);
 }
 
 function truncateTextToBudget(text: string, maxChars: number): string {
@@ -199,13 +296,17 @@ function replaceToolResultText(msg: AgentMessage, text: string): AgentMessage {
   } as AgentMessage;
 }
 
-function truncateToolResultToChars(msg: AgentMessage, maxChars: number): AgentMessage {
+function truncateToolResultToTokens(
+  msg: AgentMessage,
+  maxTokens: number,
+  cal: TokenCalibration,
+): AgentMessage {
   if (!isToolResultMessage(msg)) {
     return msg;
   }
 
-  const estimatedChars = estimateMessageChars(msg);
-  if (estimatedChars <= maxChars) {
+  const estimatedTokens = estimateMessageTokens(msg, cal);
+  if (estimatedTokens <= maxTokens) {
     return msg;
   }
 
@@ -214,25 +315,30 @@ function truncateToolResultToChars(msg: AgentMessage, maxChars: number): AgentMe
     return replaceToolResultText(msg, CONTEXT_LIMIT_TRUNCATION_NOTICE);
   }
 
+  // Truncate raw text to fit the token budget (convert back to chars using tool-result ratio).
+  const maxChars = Math.floor(maxTokens * cal.toolResultCharsPerToken);
   const truncatedText = truncateTextToBudget(rawText, maxChars);
   return replaceToolResultText(msg, truncatedText);
 }
 
 function compactExistingToolResultsInPlace(params: {
   messages: AgentMessage[];
-  charsNeeded: number;
-  contextBudgetChars: number;
+  tokensNeeded: number;
+  contextBudgetTokens: number;
   recentToolResultsToPreserve: number;
+  cal: TokenCalibration;
 }): number {
-  const { messages, charsNeeded, contextBudgetChars, recentToolResultsToPreserve } = params;
-  if (charsNeeded <= 0) {
+  const { messages, tokensNeeded, contextBudgetTokens, recentToolResultsToPreserve, cal } = params;
+  if (tokensNeeded <= 0) {
     return 0;
   }
 
-  const placeholderChars = PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER.length;
-  // Per-result minimum: savings must be at least 2× the placeholder size.
-  // Results smaller than this are not worth the per-entry cache perturbation.
-  const minPerResultSavings = placeholderChars * 2;
+  // Placeholder is plain text, so use the general (non-tool-result) ratio.
+  const placeholderTokens = Math.ceil(
+    PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER.length / cal.charsPerToken,
+  );
+  // Per-result minimum: savings must be at least 2× the placeholder token cost.
+  const minPerResultSavings = placeholderTokens * 2;
 
   // Identify the most recent N tool-result indices to protect from compaction.
   // These are results the model hasn't processed yet (or just processed this turn)
@@ -257,18 +363,18 @@ function compactExistingToolResultsInPlace(params: {
     if (!isToolResultMessage(msg)) {
       continue;
     }
-    const before = estimateMessageChars(msg);
-    if (before <= placeholderChars) {
+    const beforeTokens = estimateMessageTokens(msg, cal);
+    if (beforeTokens <= placeholderTokens) {
       continue;
     }
-    const potentialSavings = before - placeholderChars;
+    const potentialSavings = beforeTokens - placeholderTokens;
     if (potentialSavings >= minPerResultSavings) {
       totalEligibleSavings += potentialSavings;
     }
   }
 
   // Pass-level gate: skip if total savings don't justify the cache bust.
-  const minPassSavings = Math.floor(contextBudgetChars * MIN_COMPACTION_SAVINGS_RATIO);
+  const minPassSavings = Math.floor(contextBudgetTokens * MIN_COMPACTION_SAVINGS_RATIO);
   if (totalEligibleSavings < minPassSavings) {
     return 0;
   }
@@ -285,25 +391,25 @@ function compactExistingToolResultsInPlace(params: {
       continue;
     }
 
-    const before = estimateMessageChars(msg);
-    if (before <= placeholderChars) {
+    const beforeTokens = estimateMessageTokens(msg, cal);
+    if (beforeTokens <= placeholderTokens) {
       continue;
     }
 
-    const potentialSavings = before - placeholderChars;
+    const potentialSavings = beforeTokens - placeholderTokens;
     if (potentialSavings < minPerResultSavings) {
       continue;
     }
 
     const compacted = replaceToolResultText(msg, PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
     applyMessageMutationInPlace(msg, compacted);
-    const after = estimateMessageChars(msg);
-    if (after >= before) {
+    const afterTokens = estimateMessageTokens(msg, cal);
+    if (afterTokens >= beforeTokens) {
       continue;
     }
 
-    reduced += before - after;
-    if (reduced >= charsNeeded) {
+    reduced += beforeTokens - afterTokens;
+    if (reduced >= tokensNeeded) {
       break;
     }
   }
@@ -328,33 +434,44 @@ function applyMessageMutationInPlace(target: AgentMessage, source: AgentMessage)
 
 function enforceToolResultContextBudgetInPlace(params: {
   messages: AgentMessage[];
-  contextBudgetChars: number;
-  maxSingleToolResultChars: number;
+  contextBudgetTokens: number;
+  maxSingleToolResultTokens: number;
   recentToolResultsToPreserve: number;
 }): void {
-  const { messages, contextBudgetChars, maxSingleToolResultChars, recentToolResultsToPreserve } =
+  const { messages, contextBudgetTokens, maxSingleToolResultTokens, recentToolResultsToPreserve } =
     params;
+
+  // Calibrate chars/token from real usage data when available.
+  const cal = calibrateCharsPerToken(messages);
 
   // Ensure each tool result has an upper bound before considering total context usage.
   for (const message of messages) {
     if (!isToolResultMessage(message)) {
       continue;
     }
-    const truncated = truncateToolResultToChars(message, maxSingleToolResultChars);
+    const truncated = truncateToolResultToTokens(message, maxSingleToolResultTokens, cal);
     applyMessageMutationInPlace(message, truncated);
   }
 
-  let currentChars = estimateContextChars(messages);
-  if (currentChars <= contextBudgetChars) {
+  const currentTokens = estimateContextTokens(messages, cal);
+  if (currentTokens <= contextBudgetTokens) {
     return;
   }
+
+  // Hysteresis: if we're going to bust the prompt cache, free at least minPassSavings tokens
+  // (15% of budget) — not just the bare overshoot. This prevents immediate re-triggering
+  // (thrashing) by ensuring each compaction pass creates meaningful headroom.
+  const overshoot = currentTokens - contextBudgetTokens;
+  const minPassSavings = Math.floor(contextBudgetTokens * MIN_COMPACTION_SAVINGS_RATIO);
+  const tokensNeeded = Math.max(overshoot, minPassSavings);
 
   // Compact oldest tool outputs first until the context is back under budget.
   compactExistingToolResultsInPlace({
     messages,
-    charsNeeded: currentChars - contextBudgetChars,
-    contextBudgetChars,
+    tokensNeeded,
+    contextBudgetTokens,
     recentToolResultsToPreserve,
+    cal,
   });
 }
 
@@ -369,15 +486,14 @@ export function installToolResultContextGuard(params: {
 }): () => void {
   const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
   const recentToolResultsToPreserve = params.recentToolResultsToPreserve ?? 3;
-  const contextBudgetChars = Math.max(
-    1_024,
-    Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * CONTEXT_INPUT_HEADROOM_RATIO),
+  // Budget and limits are now in tokens (not chars).
+  const contextBudgetTokens = Math.max(
+    256,
+    Math.floor(contextWindowTokens * CONTEXT_INPUT_HEADROOM_RATIO),
   );
-  const maxSingleToolResultChars = Math.max(
-    1_024,
-    Math.floor(
-      contextWindowTokens * TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE * SINGLE_TOOL_RESULT_CONTEXT_SHARE,
-    ),
+  const maxSingleToolResultTokens = Math.max(
+    256,
+    Math.floor(contextWindowTokens * SINGLE_TOOL_RESULT_CONTEXT_SHARE),
   );
 
   // Agent.transformContext is private in pi-coding-agent, so access it via a
@@ -393,8 +509,8 @@ export function installToolResultContextGuard(params: {
     const contextMessages = Array.isArray(transformed) ? transformed : messages;
     enforceToolResultContextBudgetInPlace({
       messages: contextMessages,
-      contextBudgetChars,
-      maxSingleToolResultChars,
+      contextBudgetTokens,
+      maxSingleToolResultTokens,
       recentToolResultsToPreserve,
     });
 
@@ -405,3 +521,10 @@ export function installToolResultContextGuard(params: {
     mutableAgent.transformContext = originalTransformContext;
   };
 }
+
+export const __testing = {
+  calibrateCharsPerToken,
+  estimateContextTokens,
+  estimateMessageTokens,
+  rawMessageChars,
+} as const;
