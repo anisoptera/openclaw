@@ -142,7 +142,6 @@ describe("dropStaleThinkingBlocks", () => {
     const messages = makeMessages(turns);
     const result = dropStaleThinkingBlocks(messages, 5);
     expect(result).not.toBe(messages);
-    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
     const assistants = result.filter((m) => m.role === "assistant");
     expect(assistants).toHaveLength(10);
     for (let i = 0; i < 5; i++) {
@@ -172,7 +171,6 @@ describe("dropStaleThinkingBlocks", () => {
       "both",
     ]);
     const result = dropStaleThinkingBlocks(messages, 5);
-    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
     const assistants = result.filter((m) => m.role === "assistant");
     // Stale turns should keep the text block, drop thinking.
     for (let i = 0; i < 5; i++) {
@@ -202,7 +200,6 @@ describe("dropStaleThinkingBlocks", () => {
       "text",
     ]);
     const result = dropStaleThinkingBlocks(messages, 5);
-    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
     const assistants = result.filter((m) => m.role === "assistant");
     for (let i = 0; i < 5; i++) {
       expect(assistants[i].content).toEqual([{ type: "text", text: "" }]);
@@ -215,7 +212,6 @@ describe("dropStaleThinkingBlocks", () => {
     const turns: Array<"thinking"> = Array(11).fill("thinking");
     const messages = makeMessages(turns);
     const result = dropStaleThinkingBlocks(messages, 5);
-    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
     const assistants = result.filter((m) => m.role === "assistant");
     for (let i = 0; i < 5; i++) {
       expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
@@ -229,12 +225,43 @@ describe("dropStaleThinkingBlocks", () => {
     }
   });
 
+  it("strips residual <think> tags from text blocks in stale turns", () => {
+    // llama.cpp emits thinking via reasoning_content AND echoes tags in text.
+    // promoteThinkingTagsToBlocks() skips when a structured block already exists,
+    // leaving raw tags in the text block. Both must be removed on stale turns.
+    const msgs: AgentMessage[] = [];
+    for (let i = 0; i < 10; i++) {
+      msgs.push(castAgentMessage({ role: "user", content: "prompt" }));
+      msgs.push(
+        castAgentMessage({
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "t" },
+            { type: "text", text: "<think>\nt\n</think>\n\nreply" },
+          ],
+        }),
+      );
+    }
+    const result = dropStaleThinkingBlocks(msgs, 5);
+    const assistants = result.filter((m) => m.role === "assistant");
+    // Stale turns: thinking block gone, tags stripped from text, only reply remains.
+    for (let i = 0; i < 5; i++) {
+      expect(assistants[i].content).toEqual([{ type: "text", text: "reply" }]);
+    }
+    // Active turns: untouched.
+    for (let i = 5; i < 10; i++) {
+      expect(assistants[i].content).toEqual([
+        { type: "thinking", thinking: "t" },
+        { type: "text", text: "<think>\nt\n</think>\n\nreply" },
+      ]);
+    }
+  });
+
   it("strips two chunks at the third chunk boundary (T=15, chunkSize=5)", () => {
     // T=15, chunkSize=5: activeChunkStart=10, strip [0,10), keep [10,15)
     const turns: Array<"thinking"> = Array(15).fill("thinking");
     const messages = makeMessages(turns);
     const result = dropStaleThinkingBlocks(messages, 5);
-    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
     const assistants = result.filter((m) => m.role === "assistant");
     for (let i = 0; i < 10; i++) {
       expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(

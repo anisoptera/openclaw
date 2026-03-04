@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { stripReasoningTagsFromText } from "../../shared/text/reasoning-tags.js";
 
 type AssistantContentBlock = Extract<AgentMessage, { role: "assistant" }>["content"][number];
 type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>;
@@ -71,14 +72,35 @@ export function dropStaleThinkingBlocks(
       continue;
     }
 
-    // Strip thinking blocks from this stale turn.
+    // Strip thinking blocks and any residual <think> tags from this stale turn.
+    // Some providers (e.g. llama.cpp) emit thinking via a reasoning_content field AND
+    // echo the same content inside <think>...</think> tags in the text block. When
+    // promoteThinkingTagsToBlocks() sees an existing structured thinking block it skips
+    // tag promotion, leaving the raw tags in the text. Strip both here.
     const nextContent: AssistantContentBlock[] = [];
     let changed = false;
     for (const block of msg.content) {
-      if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+      if (!block || typeof block !== "object") {
+        nextContent.push(block);
+        continue;
+      }
+      const typed = block as { type?: unknown; text?: unknown };
+      if (typed.type === "thinking") {
         touched = true;
         changed = true;
         continue;
+      }
+      if (typed.type === "text" && typeof typed.text === "string") {
+        const stripped = stripReasoningTagsFromText(typed.text);
+        if (stripped !== typed.text) {
+          touched = true;
+          changed = true;
+          if (stripped) {
+            nextContent.push({ ...block, text: stripped } as AssistantContentBlock);
+          }
+          // Empty after stripping — omit; synthetic block added below if needed.
+          continue;
+        }
       }
       nextContent.push(block);
     }
