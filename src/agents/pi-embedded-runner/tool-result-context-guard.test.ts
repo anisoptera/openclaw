@@ -64,6 +64,15 @@ function getToolResultText(msg: AgentMessage): string {
   return typeof block?.text === "string" ? block.text : "";
 }
 
+function makeAssistantWithUsage(input: number, output: number = 0): AgentMessage {
+  return castAgentMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "ok" }],
+    usage: { input, output },
+    timestamp: Date.now(),
+  });
+}
+
 function makeGuardableAgent(
   transformContext?: (
     messages: AgentMessage[],
@@ -74,8 +83,10 @@ function makeGuardableAgent(
 }
 
 function makeTwoToolResultOverflowContext(): AgentMessage[] {
+  // budget=3200 (1000 tokens × 4 c/t × 0.8). user: 2200; tools: 1000 each → total 4200 > 3200.
+  // overshoot 1000 > 952 (savings per result) → both compacted.
   return [
-    makeUser("u".repeat(2_000)),
+    makeUser("u".repeat(2_200)),
     makeToolResult("call_old", "x".repeat(1_000)),
     makeToolResult("call_new", "y".repeat(1_000)),
   ];
@@ -88,6 +99,7 @@ async function applyGuardToContext(
   installToolResultContextGuard({
     agent,
     contextWindowTokens: 1_000,
+    recentToolResultsToPreserve: 0,
   });
   return await agent.transformContext?.(contextForNextCall, new AbortController().signal);
 }
@@ -120,10 +132,13 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
+    // user: 2800 chars; 3 tool results: 800 chars each → total 5200 > 3200 budget.
+    // overshoot 2000; each saves 752; need all 3 to clear 2000 (752×2=1504 < 2000 < 752×3=2256).
     const contextForNextCall = [
-      makeUser("u".repeat(2_200)),
+      makeUser("u".repeat(2_800)),
       makeToolResult("call_1", "a".repeat(800)),
       makeToolResult("call_2", "b".repeat(800)),
       makeToolResult("call_3", "c".repeat(800)),
@@ -186,8 +201,11 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
+    // user: 2600; call_old: 700 (saves 652); call_new: 1000 (saves 952). Total 4300 > 3200.
+    // overshoot 1100; call_old saves 652 < 1100, then call_new pushes total to 1604 ≥ 1100.
     const contextForNextCall = [
       makeUser("u".repeat(2_600)),
       makeToolResult("call_old", "x".repeat(700)),
@@ -221,10 +239,12 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
+    // user: 3000; tools: 1000 each → total 5000 > 3200. overshoot 1800 > 952 → both compacted.
     const contextForNextCall = [
-      makeUser("u".repeat(2_000)),
+      makeUser("u".repeat(3_000)),
       makeLegacyToolResult("call_old", "x".repeat(1_000)),
       makeLegacyToolResult("call_new", "y".repeat(1_000)),
     ];
@@ -244,10 +264,13 @@ describe("installToolResultContextGuard", () => {
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
     });
 
+    // Char estimator counts content text only (not details field). user: 2800; tools: 900 text each.
+    // Total 4600 > 3200. overshoot 1400 > 852 → both compacted; replaceToolResultText strips details.
     const contextForNextCall = [
-      makeUser("u".repeat(1_600)),
+      makeUser("u".repeat(2_800)),
       makeToolResultWithDetails("call_old", "x".repeat(900), "d".repeat(8_000)),
       makeToolResultWithDetails("call_new", "y".repeat(900), "d".repeat(8_000)),
     ];
@@ -267,5 +290,210 @@ describe("installToolResultContextGuard", () => {
     expect(newResultText).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
     expect(oldResult.details).toBeUndefined();
     expect(newResult.details).toBeUndefined();
+  });
+
+  it("skips compacting tool results below the per-result savings threshold", async () => {
+    // placeholder: 48 chars; minPerResultSavings = 48 * 2 = 96 chars.
+    // 50-char tool result: savings = 50 - 48 = 2 < 96 → skipped per-result.
+    // totalEligibleSavings = 0 < minPassSavings (640) → entire pass skipped.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(3_700)), // total 3800 > 3200: overflow, but tool results too small to compact
+      makeToolResult("call_1", "s".repeat(50)),
+      makeToolResult("call_2", "s".repeat(50)),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+    expect(getToolResultText(contextForNextCall[1])).toBe("s".repeat(50));
+    expect(getToolResultText(contextForNextCall[2])).toBe("s".repeat(50));
+  });
+
+  it("skips the compaction pass when total eligible savings are below the pass-level threshold", async () => {
+    // minPassSavings = floor(3200 * 0.2) = 640 chars.
+    // 150-char result: savings = 150 - 48 = 102 ≥ 96 (per-result ok).
+    // Two results: totalEligible = 204 < 640 → pass skipped.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(3_400)), // total 3400+150+150=3700 > 3200
+      makeToolResult("call_1", "m".repeat(150)),
+      makeToolResult("call_2", "m".repeat(150)),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+    expect(getToolResultText(contextForNextCall[1])).toBe("m".repeat(150));
+    expect(getToolResultText(contextForNextCall[2])).toBe("m".repeat(150));
+  });
+
+  it("preserves the most recent N tool results from preemptive compaction (default 3)", async () => {
+    // 4 tool results; last 3 protected by default. Only the oldest is eligible.
+    // user: 500; tools: 800 each → total 3700 > 3200. overshoot 500 < minPassSavings 640.
+    // charsNeeded = 640 (hysteresis); oldest saves 752 ≥ 640 → compacted. last 3 untouched.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(500)),
+      makeToolResult("call_1", "a".repeat(800)),
+      makeToolResult("call_2", "b".repeat(800)),
+      makeToolResult("call_3", "c".repeat(800)),
+      makeToolResult("call_4", "d".repeat(800)),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    expect(getToolResultText(contextForNextCall[1])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[2])).toBe("b".repeat(800));
+    expect(getToolResultText(contextForNextCall[3])).toBe("c".repeat(800));
+    expect(getToolResultText(contextForNextCall[4])).toBe("d".repeat(800));
+  });
+
+  it("respects a custom recentToolResultsToPreserve value", async () => {
+    // preserve=1: only call_new protected; call_old and call_mid are eligible.
+    // user: 2600; tools: 800 each → total 5000 > 3200. overshoot 1800.
+    // call_old saves 752, call_mid saves 752; eligible exhausted at 1504 → both compacted.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 1,
+    });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(2_600)),
+      makeToolResult("call_old", "x".repeat(800)),
+      makeToolResult("call_mid", "y".repeat(800)),
+      makeToolResult("call_new", "z".repeat(800)),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    expect(getToolResultText(contextForNextCall[1])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[2])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[3])).toBe("z".repeat(800));
+  });
+
+  it("skips compaction when real token usage (usage.input) is under the token budget", async () => {
+    // Char-based: user(200) + tool_1(1600 weighted) + tool_2(1600 weighted) = 3400 > 3200 → would compact.
+    // Token-based: usage.input=500 + 0 new tokens = 500 ≤ 800 (tokenBudget) → skip.
+    // This shows that accurate token data avoids false-positive compaction.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
+
+    const messages = [
+      makeUser("u".repeat(200)),
+      makeToolResult("call_1", "x".repeat(800)),
+      makeToolResult("call_2", "y".repeat(800)),
+      makeAssistantWithUsage(500, 100), // 500 real input tokens, well under 800 budget
+    ];
+
+    await agent.transformContext?.(messages, new AbortController().signal);
+
+    // Token-based check reports no overflow → tool results left untouched.
+    expect(getToolResultText(messages[1])).toBe("x".repeat(800));
+    expect(getToolResultText(messages[2])).toBe("y".repeat(800));
+  });
+
+  it("compacts oldest-first when real token usage exceeds the token budget", async () => {
+    // usage.input=900 > tokenBudget=800 → overshoot 100 tokens → charsNeeded=640 (hysteresis).
+    // call_old (800 chars, 1600 weighted): savings=1552 ≥ 640 → compacted.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const messages = [
+      makeUser("u".repeat(100)),
+      makeToolResult("call_old", "x".repeat(800)),
+      makeAssistantWithUsage(900, 50), // 900 real tokens > 800 budget
+    ];
+
+    await agent.transformContext?.(messages, new AbortController().signal);
+
+    expect(getToolResultText(messages[1])).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
+  });
+
+  it("handles anomalous usage deltas (e.g. negative) without crashing, falling back to heuristic", async () => {
+    // Negative delta (common after prior compaction): toolTokenBudget < 0 → anomalous.
+    // Attribution falls back to heuristic constant. Guard must not crash.
+    // With lastUsage.input=90 ≤ tokenBudget=800, no compaction should happen.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const messages = [
+      makeAssistantWithUsage(100, 50), // older: input=100, output=50
+      makeToolResult("call_mid", "x".repeat(800)),
+      makeAssistantWithUsage(90, 20), // newer: input=90 < 100 → delta=-10, toolTokenBudget=-60 (anomalous)
+    ];
+
+    // Must not throw; tool result between two assistants is already counted in lastUsage.input.
+    await agent.transformContext?.(messages, new AbortController().signal);
+
+    // Token-based budget check: estimatedCurrentTokens = 90 ≤ 800 → no compaction.
+    expect(getToolResultText(messages[1])).toBe("x".repeat(800));
+  });
+
+  it("falls back to char-based budget estimation when no prior assistant usage data exists", async () => {
+    // No assistant messages → char-based fallback. user(3000) + tool(1600 weighted) = 4600 > 3200 → compact.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const messages = [makeUser("u".repeat(3_000)), makeToolResult("call_1", "a".repeat(800))];
+
+    await agent.transformContext?.(messages, new AbortController().signal);
+
+    expect(getToolResultText(messages[1])).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
+  });
+
+  it("frees at least minPassSavings per compaction pass even when overshoot is smaller", async () => {
+    // overshoot 100 < minPassSavings 640 → charsNeeded = 640 (hysteresis).
+    // 200-char tool results each save 152 chars.
+    // Without hysteresis: need=100, compact 1 (152≥100, stop).
+    // With hysteresis:    need=640, compact all 3 (152×3=456, exhausts eligible) → more headroom freed.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+    });
+
+    const contextForNextCall = [
+      makeUser("u".repeat(2_700)), // total 2700+600=3300, overshoot=100
+      makeToolResult("call_1", "a".repeat(200)),
+      makeToolResult("call_2", "b".repeat(200)),
+      makeToolResult("call_3", "c".repeat(200)),
+    ];
+
+    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
+
+    // All three compacted because hysteresis raises charsNeeded to 640.
+    expect(getToolResultText(contextForNextCall[1])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[2])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
+    expect(getToolResultText(contextForNextCall[3])).toBe(
+      PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
+    );
   });
 });
