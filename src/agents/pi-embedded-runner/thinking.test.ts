@@ -1,7 +1,11 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import { castAgentMessage } from "../test-helpers/agent-message-fixtures.js";
-import { dropThinkingBlocks, isAssistantMessageWithContent } from "./thinking.js";
+import {
+  dropStaleThinkingBlocks,
+  dropThinkingBlocks,
+  isAssistantMessageWithContent,
+} from "./thinking.js";
 
 describe("isAssistantMessageWithContent", () => {
   it("accepts assistant messages with array content and rejects others", () => {
@@ -57,5 +61,190 @@ describe("dropThinkingBlocks", () => {
     const result = dropThinkingBlocks(messages);
     const assistant = result[0] as Extract<AgentMessage, { role: "assistant" }>;
     expect(assistant.content).toEqual([{ type: "text", text: "" }]);
+  });
+});
+
+describe("dropStaleThinkingBlocks", () => {
+  function makeMessages(turns: Array<"thinking" | "text" | "both" | "none">): AgentMessage[] {
+    const msgs: AgentMessage[] = [];
+    for (const kind of turns) {
+      msgs.push(castAgentMessage({ role: "user", content: "prompt" }));
+      if (kind === "thinking") {
+        msgs.push(
+          castAgentMessage({
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "t" }],
+          }),
+        );
+      } else if (kind === "text") {
+        msgs.push(
+          castAgentMessage({ role: "assistant", content: [{ type: "text", text: "reply" }] }),
+        );
+      } else if (kind === "both") {
+        msgs.push(
+          castAgentMessage({
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "t" },
+              { type: "text", text: "reply" },
+            ],
+          }),
+        );
+      } else {
+        // "none" — assistant with no thinking blocks
+        msgs.push(
+          castAgentMessage({ role: "assistant", content: [{ type: "text", text: "no-think" }] }),
+        );
+      }
+    }
+    return msgs;
+  }
+
+  it("returns original reference when there are no thinking blocks", () => {
+    const messages = makeMessages(["text", "text", "text"]);
+    expect(dropStaleThinkingBlocks(messages, 2)).toBe(messages);
+  });
+
+  it("returns original reference when chunkSize is 0 or negative", () => {
+    const messages = makeMessages(["thinking", "thinking", "thinking"]);
+    expect(dropStaleThinkingBlocks(messages, 0)).toBe(messages);
+    expect(dropStaleThinkingBlocks(messages, -1)).toBe(messages);
+  });
+
+  it("returns original reference when total turns < chunkSize (first chunk incomplete)", () => {
+    // 4 turns, chunkSize=5 → completedChunks=0 → nothing stripped
+    const messages = makeMessages(["thinking", "thinking", "thinking", "thinking"]);
+    expect(dropStaleThinkingBlocks(messages, 5)).toBe(messages);
+  });
+
+  it("returns original reference exactly at chunkSize boundary (activeChunkStart=0)", () => {
+    // 5 turns, chunkSize=5 → completedChunks=1, activeChunkStart=0 → nothing stripped
+    const messages = makeMessages(["thinking", "thinking", "thinking", "thinking", "thinking"]);
+    expect(dropStaleThinkingBlocks(messages, 5)).toBe(messages);
+  });
+
+  it("returns original reference mid-second-chunk before boundary (T=6, chunkSize=5)", () => {
+    // T=6: completedChunks=1, activeChunkStart=0 → no stripping until second chunk completes at T=10
+    const messages = makeMessages([
+      "thinking",
+      "thinking",
+      "thinking",
+      "thinking",
+      "thinking",
+      "thinking",
+    ]);
+    expect(dropStaleThinkingBlocks(messages, 5)).toBe(messages);
+  });
+
+  it("strips thinking from first chunk at second chunk boundary (T=10, chunkSize=5)", () => {
+    // T=10: completedChunks=2, activeChunkStart=5 → strip [0,5), keep [5,10)
+    const turns: Array<"thinking"> = Array(10).fill("thinking");
+    const messages = makeMessages(turns);
+    const result = dropStaleThinkingBlocks(messages, 5);
+    expect(result).not.toBe(messages);
+    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
+    const assistants = result.filter((m) => m.role === "assistant");
+    expect(assistants).toHaveLength(10);
+    for (let i = 0; i < 5; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        false,
+      );
+    }
+    for (let i = 5; i < 10; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("preserves non-thinking content when stripping stale turns", () => {
+    // 10 turns (chunkSize=5): strip turns 0-4, keep 5-9.
+    const messages = makeMessages([
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+      "both",
+    ]);
+    const result = dropStaleThinkingBlocks(messages, 5);
+    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
+    const assistants = result.filter((m) => m.role === "assistant");
+    // Stale turns should keep the text block, drop thinking.
+    for (let i = 0; i < 5; i++) {
+      expect(assistants[i].content).toEqual([{ type: "text", text: "reply" }]);
+    }
+    // Active turns should keep both blocks.
+    for (let i = 5; i < 10; i++) {
+      expect(assistants[i].content).toEqual([
+        { type: "thinking", thinking: "t" },
+        { type: "text", text: "reply" },
+      ]);
+    }
+  });
+
+  it("adds synthetic text block when stale turn had only a thinking block", () => {
+    // T=10, chunkSize=5: first 5 are thinking-only (stale), turns 5-9 are text.
+    const messages = makeMessages([
+      "thinking",
+      "thinking",
+      "thinking",
+      "thinking",
+      "thinking",
+      "text",
+      "text",
+      "text",
+      "text",
+      "text",
+    ]);
+    const result = dropStaleThinkingBlocks(messages, 5);
+    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
+    const assistants = result.filter((m) => m.role === "assistant");
+    for (let i = 0; i < 5; i++) {
+      expect(assistants[i].content).toEqual([{ type: "text", text: "" }]);
+    }
+  });
+
+  it("strips only first chunk mid-second-chunk (T=11, chunkSize=5)", () => {
+    // T=11, chunkSize=5: activeChunkStart=5, strip [0,5), keep [5,11)
+    // No additional bust until T=15.
+    const turns: Array<"thinking"> = Array(11).fill("thinking");
+    const messages = makeMessages(turns);
+    const result = dropStaleThinkingBlocks(messages, 5);
+    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
+    const assistants = result.filter((m) => m.role === "assistant");
+    for (let i = 0; i < 5; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        false,
+      );
+    }
+    for (let i = 5; i < 11; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("strips two chunks at the third chunk boundary (T=15, chunkSize=5)", () => {
+    // T=15, chunkSize=5: activeChunkStart=10, strip [0,10), keep [10,15)
+    const turns: Array<"thinking"> = Array(15).fill("thinking");
+    const messages = makeMessages(turns);
+    const result = dropStaleThinkingBlocks(messages, 5);
+    type AssistantMsg = Extract<AgentMessage, { role: "assistant" }>;
+    const assistants = result.filter((m) => m.role === "assistant");
+    for (let i = 0; i < 10; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        false,
+      );
+    }
+    for (let i = 10; i < 15; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        true,
+      );
+    }
   });
 });

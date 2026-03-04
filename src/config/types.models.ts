@@ -45,6 +45,13 @@ export type ModelDefinitionConfig = {
   maxTokens: number;
   headers?: Record<string, string>;
   compat?: ModelCompatConfig;
+  /**
+   * Remove thinking blocks from older assistant turns in chunk-sized batches to reduce KV cache
+   * invalidation. Every N assistant turns, thinking blocks from the previous N-turn chunk are
+   * stripped. 0 (default) keeps thinking blocks indefinitely. Typical value: 5.
+   * Useful for llama.cpp providers with KV cache checkpointing (e.g. Qwen3.5).
+   */
+  staleThinkingTurns?: number;
 };
 
 export type ModelProviderConfig = {

@@ -113,7 +113,7 @@ import {
   buildEmbeddedSystemPrompt,
   createSystemPromptOverride,
 } from "../system-prompt.js";
-import { dropThinkingBlocks } from "../thinking.js";
+import { dropStaleThinkingBlocks, dropThinkingBlocks } from "../thinking.js";
 import { collectAllowedToolNames } from "../tool-name-allowlist.js";
 import { installToolResultContextGuard } from "../tool-result-context-guard.js";
 import { splitSdkTools } from "../tool-split.js";
@@ -1221,6 +1221,35 @@ export async function runEmbeddedAttempt(
             return inner(model, context, options);
           }
           const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
+          if (sanitized === messages) {
+            return inner(model, context, options);
+          }
+          const nextContext = {
+            ...(context as unknown as Record<string, unknown>),
+            messages: sanitized,
+          } as unknown;
+          return inner(model, nextContext as typeof context, options);
+        };
+      }
+
+      // Strip thinking blocks from older turns in chunk-sized batches to limit KV cache
+      // invalidation on providers like llama.cpp. Only one cache bust per chunkSize turns
+      // instead of continuously growing stale tokens.
+      const staleThinkingTurns = params.config?.models?.providers?.[params.provider]?.models?.find(
+        (m) => m.id === params.modelId,
+      )?.staleThinkingTurns;
+      if (staleThinkingTurns && staleThinkingTurns > 0) {
+        const inner = activeSession.agent.streamFn;
+        activeSession.agent.streamFn = (model, context, options) => {
+          const ctx = context as unknown as { messages?: unknown };
+          const messages = ctx?.messages;
+          if (!Array.isArray(messages)) {
+            return inner(model, context, options);
+          }
+          const sanitized = dropStaleThinkingBlocks(
+            messages as unknown as AgentMessage[],
+            staleThinkingTurns,
+          ) as unknown;
           if (sanitized === messages) {
             return inner(model, context, options);
           }

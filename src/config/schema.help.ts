@@ -739,6 +739,8 @@ export const FIELD_HELP: Record<string, string> = {
     'Include absolute timestamps in message envelopes ("on" or "off").',
   "agents.defaults.envelopeElapsed": 'Include elapsed time in message envelopes ("on" or "off").',
   "agents.defaults.models": "Configured model catalog (keys are full provider/model IDs).",
+  "models.providers[].models[].staleThinkingTurns":
+    "Remove thinking blocks from older assistant turns to reduce KV cache invalidation on providers like llama.cpp. Deletions happen in chunks: every N assistant turns, thinking blocks from the previous N-turn chunk are stripped. 0 (default) keeps thinking blocks indefinitely. Typical value: 5.",
   "agents.defaults.memorySearch":
     "Vector search over MEMORY.md and memory/*.md (per-agent overrides supported).",
   "agents.defaults.memorySearch.enabled":

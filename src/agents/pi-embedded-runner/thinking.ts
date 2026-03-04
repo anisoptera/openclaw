@@ -13,6 +13,90 @@ export function isAssistantMessageWithContent(message: AgentMessage): message is
 }
 
 /**
+ * Strip thinking blocks from assistant messages in completed chunks.
+ *
+ * With `chunkSize = N`, assistant turns are grouped into chunks of N. When a new
+ * chunk boundary is crossed, all thinking blocks from every chunk before the
+ * current one are removed. This limits KV cache invalidation to one bust per N
+ * turns rather than every turn (useful for llama.cpp checkpoint-heavy providers).
+ *
+ * Example (chunkSize=5):
+ *   - T=1..5:  active chunk [0,5)   → nothing stripped
+ *   - T=6..10: active chunk [5,10)  → strip turns [0,5)
+ *   - T=11..15: active chunk [10,15) → strip turns [0,10)
+ *
+ * Returns the original array reference when nothing was changed.
+ */
+export function dropStaleThinkingBlocks(
+  messages: AgentMessage[],
+  chunkSize: number,
+): AgentMessage[] {
+  if (chunkSize <= 0) {
+    return messages;
+  }
+
+  // Count total assistant turns and build index → position map.
+  let assistantTurnCount = 0;
+  for (const msg of messages) {
+    if (isAssistantMessageWithContent(msg)) {
+      assistantTurnCount++;
+    }
+  }
+
+  // Chunk-based cutoff: strip turns with index < activeChunkStart.
+  // activeChunkStart = floor(T/N)*N - N (0 when T < N, so nothing stripped).
+  const completedChunks = Math.floor(assistantTurnCount / chunkSize);
+  if (completedChunks === 0) {
+    return messages;
+  }
+  const activeChunkStart = completedChunks * chunkSize - chunkSize;
+  if (activeChunkStart <= 0) {
+    return messages;
+  }
+
+  let touched = false;
+  let assistantIdx = 0;
+  const out: AgentMessage[] = [];
+
+  for (const msg of messages) {
+    if (!isAssistantMessageWithContent(msg)) {
+      out.push(msg);
+      continue;
+    }
+
+    const idx = assistantIdx++;
+    if (idx >= activeChunkStart) {
+      // Within the active (current) chunk — keep as-is.
+      out.push(msg);
+      continue;
+    }
+
+    // Strip thinking blocks from this stale turn.
+    const nextContent: AssistantContentBlock[] = [];
+    let changed = false;
+    for (const block of msg.content) {
+      if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+        touched = true;
+        changed = true;
+        continue;
+      }
+      nextContent.push(block);
+    }
+
+    if (!changed) {
+      out.push(msg);
+      continue;
+    }
+
+    const content =
+      nextContent.length > 0 ? nextContent : [{ type: "text", text: "" } as AssistantContentBlock];
+    out.push({ ...msg, content });
+  }
+
+  return touched ? out : messages;
+}
+
+/**
  * Strip all `type: "thinking"` content blocks from assistant messages.
  *
  * If an assistant message becomes empty after stripping, it is replaced with
