@@ -221,6 +221,7 @@ export const ModelDefinitionSchema = z
     maxTokens: z.number().positive().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     compat: ModelCompatSchema,
+    staleThinkingTurns: z.number().int().nonnegative().optional(),
   })
   .strict();
 
