@@ -45,6 +45,15 @@ export type ModelDefinitionConfig = {
   maxTokens: number;
   headers?: Record<string, string>;
   compat?: ModelCompatConfig;
+  /** Per-model overrides for tool-result context guard compaction tuning. */
+  toolResultCompaction?: {
+    /** Override CONTEXT_INPUT_HEADROOM_RATIO (default 0.8). */
+    contextHeadroomRatio?: number;
+    /** Override MIN_COMPACTION_SAVINGS_RATIO (default 0.2). */
+    minSavingsRatio?: number;
+    /** Override recentToolResultsToPreserve (default 3). */
+    recentToPreserve?: number;
+  };
 };
 
 export type ModelProviderConfig = {

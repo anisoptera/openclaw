@@ -108,9 +108,17 @@ function compactExistingToolResultsInPlace(params: {
   charsNeeded: number;
   contextBudgetChars: number;
   recentToolResultsToPreserve: number;
+  minCompactionSavingsRatio: number;
   cache: MessageCharEstimateCache;
 }): number {
-  const { messages, charsNeeded, contextBudgetChars, recentToolResultsToPreserve, cache } = params;
+  const {
+    messages,
+    charsNeeded,
+    contextBudgetChars,
+    recentToolResultsToPreserve,
+    minCompactionSavingsRatio,
+    cache,
+  } = params;
   if (charsNeeded <= 0) {
     return 0;
   }
@@ -154,7 +162,7 @@ function compactExistingToolResultsInPlace(params: {
   }
 
   // Pass-level gate: skip if total savings don't justify the cache perturbation.
-  const minPassSavings = Math.floor(contextBudgetChars * MIN_COMPACTION_SAVINGS_RATIO);
+  const minPassSavings = Math.floor(contextBudgetChars * minCompactionSavingsRatio);
   if (totalEligibleSavings < minPassSavings) {
     return 0;
   }
@@ -328,6 +336,8 @@ function enforceToolResultContextBudgetInPlace(params: {
   contextWindowTokens: number;
   maxSingleToolResultChars: number;
   recentToolResultsToPreserve: number;
+  contextInputHeadroomRatio: number;
+  minCompactionSavingsRatio: number;
   tokenCache: ToolResultTokenCache;
 }): void {
   const {
@@ -336,6 +346,8 @@ function enforceToolResultContextBudgetInPlace(params: {
     contextWindowTokens,
     maxSingleToolResultChars,
     recentToolResultsToPreserve,
+    contextInputHeadroomRatio,
+    minCompactionSavingsRatio,
     tokenCache,
   } = params;
   const charCache = createMessageCharEstimateCache();
@@ -359,7 +371,7 @@ function enforceToolResultContextBudgetInPlace(params: {
   if (lastUsage) {
     // Token-based: use real input token count from the last API call, plus an estimate
     // for new messages added since (tool results the model hasn't seen yet).
-    const tokenBudget = Math.floor(contextWindowTokens * CONTEXT_INPUT_HEADROOM_RATIO);
+    const tokenBudget = Math.floor(contextWindowTokens * contextInputHeadroomRatio);
     const lastAssistantIdx = findLastAssistantIndex(messages);
 
     let newContentTokenEstimate = 0;
@@ -392,7 +404,7 @@ function enforceToolResultContextBudgetInPlace(params: {
     overshootChars = currentChars - contextBudgetChars;
   }
 
-  const minPassSavings = Math.floor(contextBudgetChars * MIN_COMPACTION_SAVINGS_RATIO);
+  const minPassSavings = Math.floor(contextBudgetChars * minCompactionSavingsRatio);
   // Hysteresis: free at least minPassSavings per pass to avoid thrashing on near-threshold contexts.
   const charsNeeded = Math.max(overshootChars, minPassSavings);
 
@@ -401,6 +413,7 @@ function enforceToolResultContextBudgetInPlace(params: {
     charsNeeded,
     contextBudgetChars,
     recentToolResultsToPreserve,
+    minCompactionSavingsRatio,
     cache: charCache,
   });
 }
@@ -423,12 +436,20 @@ export function installToolResultContextGuard(params: {
    *  Defaults to 3 (covers parallel tool calls from a single assistant turn).
    */
   recentToolResultsToPreserve?: number;
+  /** Fraction of context window tokens to use as input budget (default 0.8). */
+  contextInputHeadroomRatio?: number;
+  /** Minimum total savings (as fraction of context budget) to justify a compaction pass (default 0.2). */
+  minCompactionSavingsRatio?: number;
 }): () => void {
   const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
   const recentToolResultsToPreserve = params.recentToolResultsToPreserve ?? 3;
+  const contextInputHeadroomRatio =
+    params.contextInputHeadroomRatio ?? CONTEXT_INPUT_HEADROOM_RATIO;
+  const minCompactionSavingsRatio =
+    params.minCompactionSavingsRatio ?? MIN_COMPACTION_SAVINGS_RATIO;
   const contextBudgetChars = Math.max(
     1_024,
-    Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * CONTEXT_INPUT_HEADROOM_RATIO),
+    Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * contextInputHeadroomRatio),
   );
   const maxSingleToolResultChars = Math.max(
     1_024,
@@ -458,6 +479,8 @@ export function installToolResultContextGuard(params: {
       contextWindowTokens,
       maxSingleToolResultChars,
       recentToolResultsToPreserve,
+      contextInputHeadroomRatio,
+      minCompactionSavingsRatio,
       tokenCache,
     });
 

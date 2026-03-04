@@ -1109,6 +1109,9 @@ export async function runEmbeddedAttempt(
         throw new Error("Embedded agent session missing");
       }
       const activeSession = session;
+      const modelDef = params.config?.models?.providers?.[params.provider]?.models?.find(
+        (m) => m.id === params.modelId,
+      );
       removeToolResultContextGuard = installToolResultContextGuard({
         agent: activeSession.agent,
         contextWindowTokens: Math.max(
@@ -1117,6 +1120,15 @@ export async function runEmbeddedAttempt(
             params.model.contextWindow ?? params.model.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
           ),
         ),
+        ...(modelDef?.toolResultCompaction?.recentToPreserve !== undefined && {
+          recentToolResultsToPreserve: modelDef.toolResultCompaction.recentToPreserve,
+        }),
+        ...(modelDef?.toolResultCompaction?.contextHeadroomRatio !== undefined && {
+          contextInputHeadroomRatio: modelDef.toolResultCompaction.contextHeadroomRatio,
+        }),
+        ...(modelDef?.toolResultCompaction?.minSavingsRatio !== undefined && {
+          minCompactionSavingsRatio: modelDef.toolResultCompaction.minSavingsRatio,
+        }),
       });
       const cacheTrace = createCacheTrace({
         cfg: params.config,

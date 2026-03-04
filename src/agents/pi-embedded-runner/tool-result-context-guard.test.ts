@@ -464,6 +464,29 @@ describe("installToolResultContextGuard", () => {
     expect(getToolResultText(messages[1])).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
   });
 
+  it("custom contextInputHeadroomRatio and minCompactionSavingsRatio change compaction behavior", async () => {
+    // With default ratios (headroom=0.8, minSavings=0.2):
+    //   budget = 1000 * 4 * 0.8 = 3200 chars. total = 2200+1000 = 3200 → no overshoot → no compaction.
+    // With tighter headroom (0.5):
+    //   budget = 1000 * 4 * 0.5 = 2000 chars. overshoot = 1200.
+    //   minPassSavings = 2000 * 0.0 = 0 → compaction runs, tool result gets compacted.
+    const agent = makeGuardableAgent();
+    installToolResultContextGuard({
+      agent,
+      contextWindowTokens: 1_000,
+      recentToolResultsToPreserve: 0,
+      contextInputHeadroomRatio: 0.5,
+      minCompactionSavingsRatio: 0.0, // disable pass-level gate
+    });
+
+    const messages = [makeUser("u".repeat(2_200)), makeToolResult("call_1", "x".repeat(1_000))];
+
+    await agent.transformContext?.(messages, new AbortController().signal);
+
+    // Under default ratios this would not be compacted, but tight headroom forces compaction.
+    expect(getToolResultText(messages[1])).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
+  });
+
   it("frees at least minPassSavings per compaction pass even when overshoot is smaller", async () => {
     // overshoot 100 < minPassSavings 640 → charsNeeded = 640 (hysteresis).
     // 200-char tool results each save 152 chars.
