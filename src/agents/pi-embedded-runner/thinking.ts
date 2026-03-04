@@ -119,6 +119,75 @@ export function dropStaleThinkingBlocks(
 }
 
 /**
+ * Strip redundant `<think>` tags from text blocks in assistant messages that
+ * already carry a structured `{type:"thinking"}` block.
+ *
+ * Some providers (e.g. llama.cpp with Qwen) emit thinking content in two forms
+ * simultaneously: a structured block (from the `reasoning_content` field) AND the
+ * same content wrapped in `<think>...</think>` tags inside the text block.
+ * `promoteThinkingTagsToBlocks()` skips promotion when a structured block exists,
+ * leaving the raw tags in the text. This function removes those tags from ALL
+ * assistant turns — both stale and active — so the redundant tokens are never
+ * sent to the provider.
+ *
+ * Returns the original array reference when nothing was changed.
+ */
+export function stripRedundantThinkingTags(messages: AgentMessage[]): AgentMessage[] {
+  let touched = false;
+  const out: AgentMessage[] = [];
+
+  for (const msg of messages) {
+    if (!isAssistantMessageWithContent(msg)) {
+      out.push(msg);
+      continue;
+    }
+
+    // Only process messages that have a structured thinking block; otherwise
+    // the <think> tags ARE the thinking and must not be stripped.
+    const hasThinkingBlock = msg.content.some(
+      (b) => b && typeof b === "object" && (b as { type?: unknown }).type === "thinking",
+    );
+    if (!hasThinkingBlock) {
+      out.push(msg);
+      continue;
+    }
+
+    const nextContent: AssistantContentBlock[] = [];
+    let changed = false;
+    for (const block of msg.content) {
+      if (!block || typeof block !== "object") {
+        nextContent.push(block);
+        continue;
+      }
+      const typed = block as { type?: unknown; text?: unknown };
+      if (typed.type === "text" && typeof typed.text === "string") {
+        const stripped = stripReasoningTagsFromText(typed.text);
+        if (stripped !== typed.text) {
+          touched = true;
+          changed = true;
+          if (stripped) {
+            nextContent.push({ ...block, text: stripped } as AssistantContentBlock);
+          }
+          continue;
+        }
+      }
+      nextContent.push(block);
+    }
+
+    if (!changed) {
+      out.push(msg);
+      continue;
+    }
+
+    const content =
+      nextContent.length > 0 ? nextContent : [{ type: "text", text: "" } as AssistantContentBlock];
+    out.push({ ...msg, content });
+  }
+
+  return touched ? out : messages;
+}
+
+/**
  * Strip all `type: "thinking"` content blocks from assistant messages.
  *
  * If an assistant message becomes empty after stripping, it is replaced with

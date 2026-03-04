@@ -5,6 +5,7 @@ import {
   dropStaleThinkingBlocks,
   dropThinkingBlocks,
   isAssistantMessageWithContent,
+  stripRedundantThinkingTags,
 } from "./thinking.js";
 
 describe("isAssistantMessageWithContent", () => {
@@ -272,6 +273,80 @@ describe("dropStaleThinkingBlocks", () => {
       expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
         true,
       );
+    }
+  });
+});
+
+describe("stripRedundantThinkingTags", () => {
+  it("returns original reference when no messages have a structured thinking block", () => {
+    const messages: AgentMessage[] = [
+      castAgentMessage({ role: "user", content: "hi" }),
+      castAgentMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "<think>reasoning</think>\n\nreply" }],
+      }),
+    ];
+    // No structured thinking block present — tags are the only thinking, must not strip.
+    expect(stripRedundantThinkingTags(messages)).toBe(messages);
+  });
+
+  it("returns original reference when no text blocks have think tags", () => {
+    const messages: AgentMessage[] = [
+      castAgentMessage({ role: "user", content: "hi" }),
+      castAgentMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "t" },
+          { type: "text", text: "reply" },
+        ],
+      }),
+    ];
+    expect(stripRedundantThinkingTags(messages)).toBe(messages);
+  });
+
+  it("strips tags from text blocks when a structured thinking block co-exists", () => {
+    const messages: AgentMessage[] = [
+      castAgentMessage({ role: "user", content: "hi" }),
+      castAgentMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "t" },
+          { type: "text", text: "<think>\nt\n</think>\n\nreply" },
+        ],
+      }),
+    ];
+    const result = stripRedundantThinkingTags(messages);
+    expect(result).not.toBe(messages);
+    const assistant = result.find((m) => m.role === "assistant");
+    expect((assistant as Extract<AgentMessage, { role: "assistant" }>).content).toEqual([
+      { type: "thinking", thinking: "t" },
+      { type: "text", text: "reply" },
+    ]);
+  });
+
+  it("processes all turns, not just stale ones", () => {
+    // Three assistant turns all with redundant tags — all should be cleaned.
+    const make = (i: number) => [
+      castAgentMessage({ role: "user", content: `q${i}` }),
+      castAgentMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: `t${i}` },
+          { type: "text", text: `<think>t${i}</think>\n\nreply${i}` },
+        ],
+      }),
+    ];
+    const messages: AgentMessage[] = [...make(1), ...make(2), ...make(3)];
+    const result = stripRedundantThinkingTags(messages);
+    const assistants = result.filter((m) => m.role === "assistant");
+    for (let i = 0; i < 3; i++) {
+      expect(assistants[i].content.some((b) => (b as { type?: string }).type === "thinking")).toBe(
+        true,
+      );
+      const textBlock = assistants[i].content.find(
+        (b) => (b as { type?: string }).type === "text",
+      ) as { type: string; text: string } | undefined;
+      expect(textBlock?.text).toBe(`reply${i + 1}`);
     }
   });
 });
