@@ -5,6 +5,7 @@ import {
   formatReasoningMessage,
   promoteThinkingTagsToBlocks,
   stripDowngradedToolCallText,
+  stripThinkingFromMessage,
 } from "./pi-embedded-utils.js";
 
 function makeAssistantMessage(
@@ -580,6 +581,58 @@ describe("promoteThinkingTagsToBlocks", () => {
     });
     promoteThinkingTagsToBlocks(msg);
     expect(msg.content).toEqual([{ type: "text", text: "hello world" }]);
+  });
+});
+
+describe("stripThinkingFromMessage", () => {
+  it("removes thinking blocks and strips <think> tags from text", () => {
+    const msg = makeAssistantMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "internal reasoning" },
+        { type: "text", text: "<think>\ninternal reasoning\n</think>\n\nreply" },
+      ],
+      timestamp: Date.now(),
+    });
+    stripThinkingFromMessage(msg);
+    expect(msg.content).toEqual([{ type: "text", text: "reply" }]);
+  });
+
+  it("removes thinking blocks with no tags in text", () => {
+    const msg = makeAssistantMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "t" },
+        { type: "text", text: "reply" },
+      ],
+      timestamp: Date.now(),
+    });
+    stripThinkingFromMessage(msg);
+    expect(msg.content).toEqual([{ type: "text", text: "reply" }]);
+  });
+
+  it("is a no-op when no thinking content", () => {
+    const content: AssistantMessage["content"] = [{ type: "text", text: "reply" }];
+    const msg = makeAssistantMessage({
+      role: "assistant",
+      content,
+      timestamp: Date.now(),
+    });
+    stripThinkingFromMessage(msg);
+    expect(msg.content).toBe(content); // same reference — nothing changed
+  });
+
+  it("adds synthetic empty text block when all content stripped", () => {
+    const msg = makeAssistantMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "t" },
+        { type: "text", text: "<think>t</think>" },
+      ],
+      timestamp: Date.now(),
+    });
+    stripThinkingFromMessage(msg);
+    expect(msg.content).toEqual([{ type: "text", text: "" }]);
   });
 });
 
