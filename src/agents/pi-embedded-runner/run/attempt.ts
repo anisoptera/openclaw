@@ -217,6 +217,18 @@ export function shouldInjectOllamaCompatNumCtx(params: {
   });
 }
 
+/** Inject `x-openclaw-session-id` header so local providers (llama.cpp, etc.) can track sessions. */
+export function wrapStreamFnWithSessionId(baseFn: StreamFn, sessionId: string): StreamFn {
+  return (model, context, options) =>
+    baseFn(model, context, {
+      ...options,
+      headers: {
+        ...options?.headers,
+        "x-openclaw-session-id": sessionId,
+      },
+    });
+}
+
 export function wrapOllamaCompatNumCtx(baseFn: StreamFn | undefined, numCtx: number): StreamFn {
   const streamFn = baseFn ?? streamSimple;
   return (model, context, options) =>
@@ -1168,6 +1180,13 @@ export async function runEmbeddedAttempt(
         // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
         activeSession.agent.streamFn = streamSimple;
       }
+
+      // Inject session ID header so llama.cpp (and other local providers)
+      // can correlate requests with the OpenClaw session.
+      activeSession.agent.streamFn = wrapStreamFnWithSessionId(
+        activeSession.agent.streamFn,
+        params.sessionId,
+      );
 
       // Ollama with OpenAI-compatible API needs num_ctx in payload.options.
       // Otherwise Ollama defaults to a 4096 context window.

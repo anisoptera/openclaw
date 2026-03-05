@@ -12,6 +12,7 @@ import {
   decodeHtmlEntitiesInObject,
   wrapOllamaCompatNumCtx,
   wrapStreamFnTrimToolCallNames,
+  wrapStreamFnWithSessionId,
 } from "./attempt.js";
 
 function createOllamaProviderConfig(injectNumCtxForOpenAICompat: boolean): OpenClawConfig {
@@ -350,6 +351,28 @@ describe("wrapStreamFnTrimToolCallNames", () => {
 
     expect(finalToolCall.name).toBe("read");
     expect(finalToolCall.id).toBe("call_42");
+  });
+});
+
+describe("wrapStreamFnWithSessionId", () => {
+  it("injects x-openclaw-session-id header into options", () => {
+    const baseFn = vi.fn(() => ({}) as never);
+    const wrapped = wrapStreamFnWithSessionId(baseFn as never, "sess-abc-123");
+    void wrapped({} as never, {} as never, {} as never);
+    expect(baseFn).toHaveBeenCalledOnce();
+    const passedOptions = baseFn.mock.calls[0][2] as Record<string, unknown>;
+    expect(passedOptions.headers).toEqual({ "x-openclaw-session-id": "sess-abc-123" });
+  });
+
+  it("preserves existing headers", () => {
+    const baseFn = vi.fn(() => ({}) as never);
+    const wrapped = wrapStreamFnWithSessionId(baseFn as never, "sess-xyz");
+    void wrapped({} as never, {} as never, { headers: { Authorization: "Bearer tok" } } as never);
+    const passedOptions = baseFn.mock.calls[0][2] as Record<string, unknown>;
+    expect(passedOptions.headers).toEqual({
+      Authorization: "Bearer tok",
+      "x-openclaw-session-id": "sess-xyz",
+    });
   });
 });
 
