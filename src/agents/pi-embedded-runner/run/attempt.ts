@@ -1126,8 +1126,8 @@ export async function runEmbeddedAttempt(
         ...(modelDef?.toolResultCompaction?.contextHeadroomRatio !== undefined && {
           contextInputHeadroomRatio: modelDef.toolResultCompaction.contextHeadroomRatio,
         }),
-        ...(modelDef?.toolResultCompaction?.minSavingsRatio !== undefined && {
-          minCompactionSavingsRatio: modelDef.toolResultCompaction.minSavingsRatio,
+        ...(modelDef?.toolResultCompaction?.hysteresisRatio !== undefined && {
+          toolResultCompactionHysteresisRatio: modelDef.toolResultCompaction.hysteresisRatio,
         }),
       });
       const cacheTrace = createCacheTrace({

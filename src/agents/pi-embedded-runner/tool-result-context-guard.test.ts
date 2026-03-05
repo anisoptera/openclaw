@@ -310,27 +310,9 @@ describe("installToolResultContextGuard", () => {
     expect(getToolResultText(contextForNextCall[2])).toBe("s".repeat(50));
   });
 
-  it("skips the compaction pass when total eligible savings are below the pass-level threshold", async () => {
-    // minPassSavings = floor(3200 * 0.2) = 640 chars.
-    // 150-char result: savings = 150 - 48 = 102 ≥ 96 (per-result ok).
-    // Two results: totalEligible = 204 < 640 → pass skipped.
-    const agent = makeGuardableAgent();
-    installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
-
-    const contextForNextCall = [
-      makeUser("u".repeat(3_400)), // total 3400+150+150=3700 > 3200
-      makeToolResult("call_1", "m".repeat(150)),
-      makeToolResult("call_2", "m".repeat(150)),
-    ];
-
-    await agent.transformContext?.(contextForNextCall, new AbortController().signal);
-    expect(getToolResultText(contextForNextCall[1])).toBe("m".repeat(150));
-    expect(getToolResultText(contextForNextCall[2])).toBe("m".repeat(150));
-  });
-
   it("preserves the most recent N tool results from preemptive compaction (default 3)", async () => {
     // 4 tool results; last 3 protected by default. Only the oldest is eligible.
-    // user: 500; tools: 800 each → total 3700 > 3200. overshoot 500 < minPassSavings 640.
+    // user: 500; tools: 800 each → total 3700 > 3200. overshoot 500 < hysteresis floor 640.
     // charsNeeded = 640 (hysteresis); oldest saves 752 ≥ 640 → compacted. last 3 untouched.
     const agent = makeGuardableAgent();
     installToolResultContextGuard({ agent, contextWindowTokens: 1_000 });
@@ -404,7 +386,8 @@ describe("installToolResultContextGuard", () => {
   });
 
   it("compacts oldest-first when real token usage exceeds the token budget", async () => {
-    // usage.input=900 > tokenBudget=800 → overshoot 100 tokens → charsNeeded=640 (hysteresis).
+    // usage.input=900 > tokenBudget=800 → overshoot 100 tokens → 400 chars overshoot.
+    // hysteresis floor = 640 chars → charsNeeded=640.
     // call_old (800 chars, 1600 weighted): savings=1552 ≥ 640 → compacted.
     const agent = makeGuardableAgent();
     installToolResultContextGuard({
@@ -464,19 +447,17 @@ describe("installToolResultContextGuard", () => {
     expect(getToolResultText(messages[1])).toBe(PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
   });
 
-  it("custom contextInputHeadroomRatio and minCompactionSavingsRatio change compaction behavior", async () => {
-    // With default ratios (headroom=0.8, minSavings=0.2):
+  it("custom contextInputHeadroomRatio changes compaction trigger point", async () => {
+    // With default headroom (0.8):
     //   budget = 1000 * 4 * 0.8 = 3200 chars. total = 2200+1000 = 3200 → no overshoot → no compaction.
     // With tighter headroom (0.5):
-    //   budget = 1000 * 4 * 0.5 = 2000 chars. overshoot = 1200.
-    //   minPassSavings = 2000 * 0.0 = 0 → compaction runs, tool result gets compacted.
+    //   budget = 1000 * 4 * 0.5 = 2000 chars. overshoot = 1200 → compaction runs.
     const agent = makeGuardableAgent();
     installToolResultContextGuard({
       agent,
       contextWindowTokens: 1_000,
       recentToolResultsToPreserve: 0,
       contextInputHeadroomRatio: 0.5,
-      minCompactionSavingsRatio: 0.0, // disable pass-level gate
     });
 
     const messages = [makeUser("u".repeat(2_200)), makeToolResult("call_1", "x".repeat(1_000))];
@@ -488,7 +469,7 @@ describe("installToolResultContextGuard", () => {
   });
 
   it("frees at least minPassSavings per compaction pass even when overshoot is smaller", async () => {
-    // overshoot 100 < minPassSavings 640 → charsNeeded = 640 (hysteresis).
+    // overshoot 100 < hysteresis floor 640 → charsNeeded = 640 (hysteresis).
     // 200-char tool results each save 152 chars.
     // Without hysteresis: need=100, compact 1 (152≥100, stop).
     // With hysteresis:    need=640, compact all 3 (152×3=456, exhausts eligible) → more headroom freed.

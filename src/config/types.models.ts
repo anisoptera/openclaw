@@ -49,8 +49,8 @@ export type ModelDefinitionConfig = {
   toolResultCompaction?: {
     /** Override CONTEXT_INPUT_HEADROOM_RATIO (default 0.8). */
     contextHeadroomRatio?: number;
-    /** Override MIN_COMPACTION_SAVINGS_RATIO (default 0.2). */
-    minSavingsRatio?: number;
+    /** Minimum freed headroom per pass as fraction of context budget (default 0.2). */
+    hysteresisRatio?: number;
     /** Override recentToolResultsToPreserve (default 3). */
     recentToPreserve?: number;
   };

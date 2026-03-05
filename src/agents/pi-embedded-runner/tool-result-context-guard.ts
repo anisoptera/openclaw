@@ -14,11 +14,9 @@ import {
 // Keep a conservative input budget to absorb tokenizer variance and provider framing overhead.
 const CONTEXT_INPUT_HEADROOM_RATIO = 0.8;
 const SINGLE_TOOL_RESULT_CONTEXT_SHARE = 0.5;
-// Minimum total eligible savings (as fraction of context budget) to justify a compaction pass.
-// Skipping passes with marginal gains avoids cache perturbations for little benefit; when we do
-// compact, we free meaningful headroom.
-const MIN_COMPACTION_SAVINGS_RATIO = 0.2;
-
+// Minimum freed headroom (as fraction of context budget) per compaction pass.
+// Once triggered, we free at least this much to avoid re-triggering next turn.
+const TOOL_RESULT_COMPACTION_HYSTERESIS_RATIO = 0.2;
 // Sanity bounds for token attribution: if the implied chars-per-token ratio for a tool
 // result falls outside this range, the attribution is likely distorted (e.g. by a prior
 // compaction removing content) and we fall back to the heuristic constant.
@@ -106,19 +104,10 @@ function truncateToolResultToChars(
 function compactExistingToolResultsInPlace(params: {
   messages: AgentMessage[];
   charsNeeded: number;
-  contextBudgetChars: number;
   recentToolResultsToPreserve: number;
-  minCompactionSavingsRatio: number;
   cache: MessageCharEstimateCache;
 }): number {
-  const {
-    messages,
-    charsNeeded,
-    contextBudgetChars,
-    recentToolResultsToPreserve,
-    minCompactionSavingsRatio,
-    cache,
-  } = params;
+  const { messages, charsNeeded, recentToolResultsToPreserve, cache } = params;
   if (charsNeeded <= 0) {
     return 0;
   }
@@ -139,33 +128,6 @@ function compactExistingToolResultsInPlace(params: {
   }
   const protectedStart = Math.max(0, toolResultIndices.length - recentToolResultsToPreserve);
   const protectedIndices = new Set(toolResultIndices.slice(protectedStart));
-
-  // Pre-scan: sum potential savings across eligible (non-protected) results.
-  // The pass-level gate ensures we only bust the cache when total benefit justifies it.
-  let totalEligibleSavings = 0;
-  for (let i = 0; i < messages.length; i++) {
-    if (protectedIndices.has(i)) {
-      continue;
-    }
-    const msg = messages[i];
-    if (!isToolResultMessage(msg)) {
-      continue;
-    }
-    const before = estimateMessageCharsCached(msg, cache);
-    if (before <= placeholderChars) {
-      continue;
-    }
-    const potentialSavings = before - placeholderChars;
-    if (potentialSavings >= minPerResultSavings) {
-      totalEligibleSavings += potentialSavings;
-    }
-  }
-
-  // Pass-level gate: skip if total savings don't justify the cache perturbation.
-  const minPassSavings = Math.floor(contextBudgetChars * minCompactionSavingsRatio);
-  if (totalEligibleSavings < minPassSavings) {
-    return 0;
-  }
 
   let reduced = 0;
   for (let i = 0; i < messages.length; i++) {
@@ -337,7 +299,7 @@ function enforceToolResultContextBudgetInPlace(params: {
   maxSingleToolResultChars: number;
   recentToolResultsToPreserve: number;
   contextInputHeadroomRatio: number;
-  minCompactionSavingsRatio: number;
+  toolResultCompactionHysteresisRatio: number;
   tokenCache: ToolResultTokenCache;
 }): void {
   const {
@@ -347,7 +309,7 @@ function enforceToolResultContextBudgetInPlace(params: {
     maxSingleToolResultChars,
     recentToolResultsToPreserve,
     contextInputHeadroomRatio,
-    minCompactionSavingsRatio,
+    toolResultCompactionHysteresisRatio,
     tokenCache,
   } = params;
   const charCache = createMessageCharEstimateCache();
@@ -404,16 +366,14 @@ function enforceToolResultContextBudgetInPlace(params: {
     overshootChars = currentChars - contextBudgetChars;
   }
 
-  const minPassSavings = Math.floor(contextBudgetChars * minCompactionSavingsRatio);
-  // Hysteresis: free at least minPassSavings per pass to avoid thrashing on near-threshold contexts.
-  const charsNeeded = Math.max(overshootChars, minPassSavings);
+  // Hysteresis: free at least this much per pass to avoid re-triggering next turn.
+  const hysteresisFloor = Math.floor(contextBudgetChars * toolResultCompactionHysteresisRatio);
+  const charsNeeded = Math.max(overshootChars, hysteresisFloor);
 
   compactExistingToolResultsInPlace({
     messages,
     charsNeeded,
-    contextBudgetChars,
     recentToolResultsToPreserve,
-    minCompactionSavingsRatio,
     cache: charCache,
   });
 }
@@ -438,15 +398,16 @@ export function installToolResultContextGuard(params: {
   recentToolResultsToPreserve?: number;
   /** Fraction of context window tokens to use as input budget (default 0.8). */
   contextInputHeadroomRatio?: number;
-  /** Minimum total savings (as fraction of context budget) to justify a compaction pass (default 0.2). */
-  minCompactionSavingsRatio?: number;
+  /** Minimum freed headroom per pass as fraction of context budget (default 0.2).
+   *  Once triggered, we free at least this much to avoid re-triggering next turn. */
+  toolResultCompactionHysteresisRatio?: number;
 }): () => void {
   const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
   const recentToolResultsToPreserve = params.recentToolResultsToPreserve ?? 3;
   const contextInputHeadroomRatio =
     params.contextInputHeadroomRatio ?? CONTEXT_INPUT_HEADROOM_RATIO;
-  const minCompactionSavingsRatio =
-    params.minCompactionSavingsRatio ?? MIN_COMPACTION_SAVINGS_RATIO;
+  const toolResultCompactionHysteresisRatio =
+    params.toolResultCompactionHysteresisRatio ?? TOOL_RESULT_COMPACTION_HYSTERESIS_RATIO;
   const contextBudgetChars = Math.max(
     1_024,
     Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * contextInputHeadroomRatio),
@@ -480,7 +441,7 @@ export function installToolResultContextGuard(params: {
       maxSingleToolResultChars,
       recentToolResultsToPreserve,
       contextInputHeadroomRatio,
-      minCompactionSavingsRatio,
+      toolResultCompactionHysteresisRatio,
       tokenCache,
     });
 
