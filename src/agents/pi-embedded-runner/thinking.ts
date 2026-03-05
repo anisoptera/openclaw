@@ -14,6 +14,41 @@ export function isAssistantMessageWithContent(message: AgentMessage): message is
 }
 
 /**
+ * Strip `<think>`/`<thinking>`/`<thought>` tags from text blocks in a content array.
+ * Non-text and null/non-object blocks are passed through unchanged.
+ * Text blocks that become empty after stripping are omitted (callers add a synthetic
+ * fallback block when needed to preserve turn structure).
+ * Returns `{ content, changed }` where `content` is a new array only when `changed` is true.
+ */
+function stripTagsFromContent(blocks: AssistantContentBlock[]): {
+  content: AssistantContentBlock[];
+  changed: boolean;
+} {
+  const next: AssistantContentBlock[] = [];
+  let changed = false;
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") {
+      next.push(block);
+      continue;
+    }
+    const typed = block as { type?: unknown; text?: unknown };
+    if (typed.type === "text" && typeof typed.text === "string") {
+      const stripped = stripReasoningTagsFromText(typed.text);
+      if (stripped !== typed.text) {
+        changed = true;
+        if (stripped) {
+          next.push({ ...block, text: stripped } as AssistantContentBlock);
+        }
+        // Empty after stripping — omit; caller adds synthetic block if needed.
+        continue;
+      }
+    }
+    next.push(block);
+  }
+  return { content: next, changed };
+}
+
+/**
  * Strip thinking blocks from assistant messages in completed chunks.
  *
  * With `chunkSize = N`, assistant turns are grouped into chunks of N. When a new
@@ -36,7 +71,7 @@ export function dropStaleThinkingBlocks(
     return messages;
   }
 
-  // Count total assistant turns and build index → position map.
+  // Count total assistant turns.
   let assistantTurnCount = 0;
   for (const msg of messages) {
     if (isAssistantMessageWithContent(msg)) {
@@ -45,7 +80,8 @@ export function dropStaleThinkingBlocks(
   }
 
   // Chunk-based cutoff: strip turns with index < activeChunkStart.
-  // activeChunkStart = floor(T/N)*N - N (0 when T < N, so nothing stripped).
+  // At T=N: completedChunks=1, activeChunkStart=0 → early return, nothing stripped yet.
+  // At T=2N: completedChunks=2, activeChunkStart=N → strip first chunk [0,N).
   const completedChunks = Math.floor(assistantTurnCount / chunkSize);
   if (completedChunks === 0) {
     return messages;
@@ -72,46 +108,24 @@ export function dropStaleThinkingBlocks(
       continue;
     }
 
-    // Strip thinking blocks and any residual <think> tags from this stale turn.
-    // Some providers (e.g. llama.cpp) emit thinking via a reasoning_content field AND
-    // echo the same content inside <think>...</think> tags in the text block. When
-    // promoteThinkingTagsToBlocks() sees an existing structured thinking block it skips
-    // tag promotion, leaving the raw tags in the text. Strip both here.
-    const nextContent: AssistantContentBlock[] = [];
-    let changed = false;
-    for (const block of msg.content) {
-      if (!block || typeof block !== "object") {
-        nextContent.push(block);
-        continue;
-      }
-      const typed = block as { type?: unknown; text?: unknown };
-      if (typed.type === "thinking") {
-        touched = true;
-        changed = true;
-        continue;
-      }
-      if (typed.type === "text" && typeof typed.text === "string") {
-        const stripped = stripReasoningTagsFromText(typed.text);
-        if (stripped !== typed.text) {
-          touched = true;
-          changed = true;
-          if (stripped) {
-            nextContent.push({ ...block, text: stripped } as AssistantContentBlock);
-          }
-          // Empty after stripping — omit; synthetic block added below if needed.
-          continue;
-        }
-      }
-      nextContent.push(block);
-    }
+    // Stale turn: drop thinking blocks and strip residual <think> tags from text.
+    // Some providers (e.g. llama.cpp) emit thinking via reasoning_content AND echo the
+    // same content in <think> tags in the text block. promoteThinkingTagsToBlocks() skips
+    // promotion when a structured block exists, leaving the raw tags. Strip both.
+    const withoutThinking = msg.content.filter(
+      (b) => !(b && typeof b === "object" && (b as { type?: unknown }).type === "thinking"),
+    );
+    const thinkingDropped = withoutThinking.length < msg.content.length;
+    const { content: stripped, changed: tagsStripped } = stripTagsFromContent(withoutThinking);
 
-    if (!changed) {
+    if (!thinkingDropped && !tagsStripped) {
       out.push(msg);
       continue;
     }
 
+    touched = true;
     const content =
-      nextContent.length > 0 ? nextContent : [{ type: "text", text: "" } as AssistantContentBlock];
+      stripped.length > 0 ? stripped : [{ type: "text", text: "" } as AssistantContentBlock];
     out.push({ ...msg, content });
   }
 
@@ -152,36 +166,16 @@ export function stripRedundantThinkingTags(messages: AgentMessage[]): AgentMessa
       continue;
     }
 
-    const nextContent: AssistantContentBlock[] = [];
-    let changed = false;
-    for (const block of msg.content) {
-      if (!block || typeof block !== "object") {
-        nextContent.push(block);
-        continue;
-      }
-      const typed = block as { type?: unknown; text?: unknown };
-      if (typed.type === "text" && typeof typed.text === "string") {
-        const stripped = stripReasoningTagsFromText(typed.text);
-        if (stripped !== typed.text) {
-          touched = true;
-          changed = true;
-          if (stripped) {
-            nextContent.push({ ...block, text: stripped } as AssistantContentBlock);
-          }
-          continue;
-        }
-      }
-      nextContent.push(block);
-    }
-
+    const { content, changed } = stripTagsFromContent(msg.content);
     if (!changed) {
       out.push(msg);
       continue;
     }
 
-    const content =
-      nextContent.length > 0 ? nextContent : [{ type: "text", text: "" } as AssistantContentBlock];
-    out.push({ ...msg, content });
+    touched = true;
+    const nextContent =
+      content.length > 0 ? content : [{ type: "text", text: "" } as AssistantContentBlock];
+    out.push({ ...msg, content: nextContent });
   }
 
   return touched ? out : messages;
