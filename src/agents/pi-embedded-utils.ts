@@ -337,29 +337,6 @@ export function promoteThinkingTagsToBlocks(message: AssistantMessage): void {
     (block) => block && typeof block === "object" && block.type === "thinking",
   );
   if (hasThinkingBlock) {
-    // Structured thinking block already exists (e.g. from reasoning_content).
-    // Still strip redundant <think> tags from text blocks — some providers like
-    // llama.cpp echo thinking in both the reasoning_content field AND as raw tags
-    // in the text block. promoteThinkingTagsToBlocks would normally convert them,
-    // but skips when a structured block is already present.
-    let changed = false;
-    const next: AssistantMessage["content"] = [];
-    for (const block of message.content) {
-      if (block.type === "text") {
-        const stripped = stripReasoningTagsFromText(block.text);
-        if (stripped !== block.text) {
-          changed = true;
-          if (stripped) {
-            next.push({ ...block, text: stripped });
-          }
-          continue;
-        }
-      }
-      next.push(block);
-    }
-    if (changed) {
-      message.content = next;
-    }
     return;
   }
 
@@ -397,41 +374,6 @@ export function promoteThinkingTagsToBlocks(message: AssistantMessage): void {
     return;
   }
   message.content = next;
-}
-
-/**
- * Strips all thinking content from a stored assistant message in-place.
- * Removes {type:"thinking"} blocks and strips <think> tags from text blocks.
- * Call after thinking has been extracted for display/logging.
- */
-export function stripThinkingFromMessage(message: AssistantMessage): void {
-  if (!Array.isArray(message.content)) {
-    return;
-  }
-  let changed = false;
-  const next: AssistantMessage["content"] = [];
-  for (const block of message.content) {
-    if (block.type === "thinking") {
-      changed = true;
-      continue;
-    }
-    if (block.type === "text") {
-      const stripped = stripReasoningTagsFromText(block.text);
-      if (stripped !== block.text) {
-        changed = true;
-        if (stripped) {
-          next.push({ ...block, text: stripped });
-        }
-        continue;
-      }
-    }
-    next.push(block);
-  }
-  if (!changed) {
-    return;
-  }
-  // Preserve turn structure: always keep at least one block.
-  message.content = next.length > 0 ? next : [{ type: "text", text: "" }];
 }
 
 export function extractThinkingFromTaggedText(text: string): string {
