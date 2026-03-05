@@ -16,6 +16,7 @@ import {
   extractThinkingFromTaggedText,
   formatReasoningMessage,
   promoteThinkingTagsToBlocks,
+  stripThinkingFromMessage,
 } from "./pi-embedded-utils.js";
 
 const stripTrailingDirective = (text: string): string => {
@@ -281,11 +282,12 @@ export function handleMessageEnd(
     ctx.state.includeReasoning || ctx.state.streamReasoning
       ? extractAssistantThinking(assistantMessage) || extractThinkingFromTaggedText(rawText)
       : "";
-  // Note: {type:"thinking"} blocks are intentionally kept in the stored message so the
-  // llama.cpp KV cache prefix stays intact across turns. Raw <think> tags were already
-  // stripped from text blocks by promoteThinkingTagsToBlocks above.
-  // Old thinking blocks are removed before LLM calls by the dropStaleThinkingBlocks
-  // streamFn wrapper (controlled by the staleThinkingTurns model config).
+  // Strip all thinking blocks and residual <think> tags from the stored message.
+  // Thinking content has already been extracted above for display/logging.
+  // The streamFn would remove thinking on the very next turn anyway (via
+  // dropStaleThinkingBlocks), so there is no KV cache advantage to keeping blocks in
+  // the stored message — strip immediately to keep storage clean.
+  stripThinkingFromMessage(assistantMessage);
   const formattedReasoning = rawThinking ? formatReasoningMessage(rawThinking) : "";
   const trimmedText = text.trim();
   const parsedText = trimmedText ? parseReplyDirectives(stripTrailingDirective(trimmedText)) : null;
