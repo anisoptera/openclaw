@@ -337,6 +337,29 @@ export function promoteThinkingTagsToBlocks(message: AssistantMessage): void {
     (block) => block && typeof block === "object" && block.type === "thinking",
   );
   if (hasThinkingBlock) {
+    // Structured thinking block already exists (e.g. from reasoning_content).
+    // Still strip redundant <think> tags from text blocks — some providers like
+    // llama.cpp echo thinking in both the reasoning_content field AND as raw tags
+    // in the text block. promoteThinkingTagsToBlocks would normally convert them,
+    // but skips when a structured block is already present.
+    let changed = false;
+    const next: AssistantMessage["content"] = [];
+    for (const block of message.content) {
+      if (block.type === "text") {
+        const stripped = stripReasoningTagsFromText(block.text);
+        if (stripped !== block.text) {
+          changed = true;
+          if (stripped) {
+            next.push({ ...block, text: stripped });
+          }
+          continue;
+        }
+      }
+      next.push(block);
+    }
+    if (changed) {
+      message.content = next;
+    }
     return;
   }
 

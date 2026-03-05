@@ -113,11 +113,7 @@ import {
   buildEmbeddedSystemPrompt,
   createSystemPromptOverride,
 } from "../system-prompt.js";
-import {
-  dropStaleThinkingBlocks,
-  dropThinkingBlocks,
-  stripRedundantThinkingTags,
-} from "../thinking.js";
+import { dropStaleThinkingBlocks, dropThinkingBlocks } from "../thinking.js";
 import { collectAllowedToolNames } from "../tool-name-allowlist.js";
 import { installToolResultContextGuard } from "../tool-result-context-guard.js";
 import { splitSdkTools } from "../tool-split.js";
@@ -1251,11 +1247,8 @@ export async function runEmbeddedAttempt(
             return inner(model, context, options);
           }
           let msgs = messages as unknown as AgentMessage[];
-          // Pass 1: strip redundant <think> tags from ALL turns that have a structured
-          // thinking block. Providers like llama.cpp echo thinking in both reasoning_content
-          // and <think> tags in the text — the tags are pure waste for all turns.
-          msgs = stripRedundantThinkingTags(msgs);
-          // Pass 2: remove thinking blocks (and any remaining tags) from completed chunks.
+          // Remove thinking blocks (and any remaining tags) from completed chunks.
+          // Redundant <think> tags are stripped at storage time in promoteThinkingTagsToBlocks.
           msgs = dropStaleThinkingBlocks(msgs, staleThinkingTurns);
           if ((msgs as unknown) === messages) {
             return inner(model, context, options);
