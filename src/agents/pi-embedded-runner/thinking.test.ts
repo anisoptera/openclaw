@@ -62,6 +62,39 @@ describe("dropThinkingBlocks", () => {
     const assistant = result[0] as Extract<AgentMessage, { role: "assistant" }>;
     expect(assistant.content).toEqual([{ type: "text", text: "" }]);
   });
+
+  it("strips residual <think> tags from text blocks alongside thinking blocks", () => {
+    // llama.cpp emits thinking via reasoning_content AND echoes tags in text.
+    const messages: AgentMessage[] = [
+      castAgentMessage({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal" },
+          { type: "text", text: "<think>\ninternal\n</think>\n\nfinal answer" },
+        ],
+      }),
+    ];
+
+    const result = dropThinkingBlocks(messages);
+    const assistant = result[0] as Extract<AgentMessage, { role: "assistant" }>;
+    expect(result).not.toBe(messages);
+    expect(assistant.content).toEqual([{ type: "text", text: "final answer" }]);
+  });
+
+  it("strips <think> tags even when no structured thinking block is present", () => {
+    // Edge case: raw tags in text without a corresponding thinking block.
+    const messages: AgentMessage[] = [
+      castAgentMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "<think>\nhidden\n</think>\n\nvisible" }],
+      }),
+    ];
+
+    const result = dropThinkingBlocks(messages);
+    const assistant = result[0] as Extract<AgentMessage, { role: "assistant" }>;
+    expect(result).not.toBe(messages);
+    expect(assistant.content).toEqual([{ type: "text", text: "visible" }]);
+  });
 });
 
 describe("dropStaleThinkingBlocks", () => {

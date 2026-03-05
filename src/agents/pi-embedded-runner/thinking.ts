@@ -133,7 +133,12 @@ export function dropStaleThinkingBlocks(
 }
 
 /**
- * Strip all `type: "thinking"` content blocks from assistant messages.
+ * Strip all `type: "thinking"` content blocks and residual `<think>` tags from
+ * assistant messages.
+ *
+ * Some providers (e.g. llama.cpp) emit thinking via both a structured
+ * `{type:"thinking"}` block and echoed `<think>` tags in the text block.
+ * Both forms are removed here so nothing persists to downstream consumers.
  *
  * If an assistant message becomes empty after stripping, it is replaced with
  * a synthetic `{ type: "text", text: "" }` block to preserve turn structure
@@ -150,23 +155,21 @@ export function dropThinkingBlocks(messages: AgentMessage[]): AgentMessage[] {
       out.push(msg);
       continue;
     }
-    const nextContent: AssistantContentBlock[] = [];
-    let changed = false;
-    for (const block of msg.content) {
-      if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
-        touched = true;
-        changed = true;
-        continue;
-      }
-      nextContent.push(block);
-    }
-    if (!changed) {
+    const withoutThinking = msg.content.filter(
+      (b) => !(b && typeof b === "object" && (b as { type?: unknown }).type === "thinking"),
+    );
+    const thinkingDropped = withoutThinking.length < msg.content.length;
+    const { content: stripped, changed: tagsStripped } = stripTagsFromContent(withoutThinking);
+
+    if (!thinkingDropped && !tagsStripped) {
       out.push(msg);
       continue;
     }
+
+    touched = true;
     // Preserve the assistant turn even if all blocks were thinking-only.
     const content =
-      nextContent.length > 0 ? nextContent : [{ type: "text", text: "" } as AssistantContentBlock];
+      stripped.length > 0 ? stripped : [{ type: "text", text: "" } as AssistantContentBlock];
     out.push({ ...msg, content });
   }
   return touched ? out : messages;
